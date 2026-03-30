@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         note.com Account Blocker
 // @namespace    https://note.com/
-// @version      2.3
+// @version      2.4
 // @description  noteのハッシュタグ・検索ページから特定アカウントの記事を非表示にする
 // @match        https://note.com/*
 // @grant        none
@@ -45,7 +45,6 @@
   document.head.appendChild(uiStyle);
 
   const STORAGE_KEY = 'note_blocked_accounts';
-  const CARD_CLASS_FRAGMENT = 'timelineItemWrapper';
 
   // ---- ブロックリスト管理 ----
   function getBlockList() {
@@ -64,7 +63,7 @@
     localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
   }
 
-  // ---- URL正規化 + ユーザー名抽出（記事URLのみ） ----
+  // ---- URL正規化 + ユーザー名抽出 ----
   const SYSTEM_PATHS = new Set([
     'hashtag','search','signup','login','settings',
     'notifications','premium','topics','ranking','magazine'
@@ -72,14 +71,12 @@
 
   function extractUsername(href) {
     if (!href) return null;
-    // 相対・絶対・クエリ付きいずれでもpathnameに正規化
     let pathname;
     try {
       pathname = new URL(href, location.origin).pathname;
     } catch {
       return null;
     }
-    // 記事URL: /username/n/noteId
     const match = pathname.match(/^\/([^\/]+)\/n\//);
     if (!match) return null;
     const name = match[1];
@@ -87,8 +84,34 @@
     return name;
   }
 
+  // ---- カード要素の判定 ----
+  // トップページ: section.m-largeNoteWrapper（個別カード）
+  // ハッシュタグページ: div.m-timelineItemWrapper__itemWrapper（グリッドアイテム）
+  function isCardElement(el) {
+    const cls = el.className;
+    if (typeof cls !== 'string') return false;
+
+    // m-largeNoteWrapper（サブコンポーネント __card, __link 等は除外）
+    if (cls.includes('largeNoteWrapper') && !cls.includes('largeNoteWrapper__')) return true;
+
+    // m-timelineItemWrapper__itemWrapper（ハッシュタグページのグリッドアイテム）
+    if (cls.includes('timelineItemWrapper__itemWrapper')) return true;
+
+    return false;
+  }
+
+  // ---- カード要素を探す（リンクから上に辿って最初のカードを返す） ----
+  function findCard(el) {
+    let node = el;
+    for (let i = 0; i < 20; i++) {
+      if (!node) return null;
+      if (isCardElement(node)) return node;
+      node = node.parentElement;
+    }
+    return null;
+  }
+
   // ---- CSSルールを再生成 ----
-  // 注: CSS側は href 属性値をそのまま見るため、相対パスと絶対パスの両方に対応
   function rebuildBlockCSS() {
     const list = getBlockList();
     if (list.length === 0) {
@@ -99,29 +122,19 @@
     const selectors = list.flatMap(username => {
       const escaped = CSS.escape(username);
       return [
-        // 相対パス: /username/n/...
-        `div[class*="${CARD_CLASS_FRAGMENT}"]:has(a[href^="/${escaped}/n/"])`,
-        // 絶対パス: https://note.com/username/n/...
-        `div[class*="${CARD_CLASS_FRAGMENT}"]:has(a[href*="note.com/${escaped}/n/"])`
+        // ハッシュタグページ（グリッドアイテム）
+        `div[class*="timelineItemWrapper__itemWrapper"]:has(a[href^="/${escaped}/n/"])`,
+        `div[class*="timelineItemWrapper__itemWrapper"]:has(a[href*="note.com/${escaped}/n/"])`,
+        // トップページ（横スクロール内の個別カード）
+        `.m-largeNoteWrapper:has(a[href^="/${escaped}/n/"])`,
+        `.m-largeNoteWrapper:has(a[href*="note.com/${escaped}/n/"])`
       ];
     });
 
     blockStyle.textContent = `${selectors.join(',\n')} { display: none !important; }`;
   }
 
-  // ---- カード要素を探す ----
-  function findCard(el) {
-    let node = el;
-    for (let i = 0; i < 20; i++) {
-      if (!node) return null;
-      const cls = node.className || '';
-      if (typeof cls === 'string' && cls.includes(CARD_CLASS_FRAGMENT)) return node;
-      node = node.parentElement;
-    }
-    return null;
-  }
-
-  // ---- ブロックボタンを付与（root自身 + 子孫、DOM再利用に対応） ----
+  // ---- ブロックボタンを付与 ----
   function addBlockButtonsInSubtree(root) {
     const blockList = getBlockList();
 
@@ -142,13 +155,10 @@
       const card = findCard(link);
       if (!card) return;
 
-      // DOM再利用検出: カードの中身が別ユーザーに差し替わった場合、
-      // 古いボタンを除去して再処理する
       const prevUser = card.dataset.nbUser;
-      if (prevUser === username) return; // 同じユーザー、処理済み
+      if (prevUser === username) return;
 
       if (prevUser && prevUser !== username) {
-        // カードが再利用された: 古いボタンを除去
         const oldBtn = card.querySelector('.note-blocker-btn');
         if (oldBtn) oldBtn.remove();
       }
@@ -178,7 +188,7 @@
     });
   }
 
-  // ---- MutationObserver（追加ノードを蓄積 + debounce） ----
+  // ---- MutationObserver ----
   const pendingRoots = new Set();
   let debounceTimer = null;
   const DEBOUNCE_MS = 200;
