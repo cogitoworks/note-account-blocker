@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         note.com Account Blocker
 // @namespace    https://note.com/
-// @version      2.0
+// @version      2.3
 // @description  noteのハッシュタグ・検索ページから特定アカウントの記事を非表示にする
 // @match        https://note.com/*
 // @grant        none
@@ -10,8 +10,6 @@
 
 (function () {
   'use strict';
-
-  const STORAGE_KEY = 'note_blocked_accounts';
 
   // ---- ブロック用CSSを動的生成するstyle要素 ----
   const blockStyle = document.createElement('style');
@@ -46,6 +44,9 @@
   `;
   document.head.appendChild(uiStyle);
 
+  const STORAGE_KEY = 'note_blocked_accounts';
+  const CARD_CLASS_FRAGMENT = 'timelineItemWrapper';
+
   // ---- ブロックリスト管理 ----
   function getBlockList() {
     try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; }
@@ -63,8 +64,31 @@
     localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
   }
 
+  // ---- URL正規化 + ユーザー名抽出（記事URLのみ） ----
+  const SYSTEM_PATHS = new Set([
+    'hashtag','search','signup','login','settings',
+    'notifications','premium','topics','ranking','magazine'
+  ]);
+
+  function extractUsername(href) {
+    if (!href) return null;
+    // 相対・絶対・クエリ付きいずれでもpathnameに正規化
+    let pathname;
+    try {
+      pathname = new URL(href, location.origin).pathname;
+    } catch {
+      return null;
+    }
+    // 記事URL: /username/n/noteId
+    const match = pathname.match(/^\/([^\/]+)\/n\//);
+    if (!match) return null;
+    const name = match[1];
+    if (SYSTEM_PATHS.has(name)) return null;
+    return name;
+  }
+
   // ---- CSSルールを再生成 ----
-  // :has() セレクタで「ブロック対象ユーザーへのリンクを含むカード」を純CSSで非表示
+  // 注: CSS側は href 属性値をそのまま見るため、相対パスと絶対パスの両方に対応
   function rebuildBlockCSS() {
     const list = getBlockList();
     if (list.length === 0) {
@@ -72,32 +96,17 @@
       return;
     }
 
-    // 各ユーザーに対して、そのユーザーの記事リンクを含むカードを非表示にするルール
-    const selectors = list.map(username => {
+    const selectors = list.flatMap(username => {
       const escaped = CSS.escape(username);
-      return `
-        .m-timelineItemWrapper__itemWrapper:has(a[href^="/${escaped}/"]),
-        .m-timelineItemWrapper__itemWrapper:has(a[href^="/${escaped}/n/"]),
-        div[class*="timelineItemWrapper"]:has(a[href^="/${escaped}/"]),
-        div[class*="noteCard"]:has(a[href^="/${escaped}/"])
-      `;
+      return [
+        // 相対パス: /username/n/...
+        `div[class*="${CARD_CLASS_FRAGMENT}"]:has(a[href^="/${escaped}/n/"])`,
+        // 絶対パス: https://note.com/username/n/...
+        `div[class*="${CARD_CLASS_FRAGMENT}"]:has(a[href*="note.com/${escaped}/n/"])`
+      ];
     });
 
-    blockStyle.textContent = `
-      ${selectors.join(',\n')} {
-        display: none !important;
-      }
-    `;
-  }
-
-  // ---- ユーザー名抽出 ----
-  function extractUsername(href) {
-    if (!href) return null;
-    const match = href.match(/^\/([^\/]+)/);
-    if (!match) return null;
-    const name = match[1];
-    if (['hashtag','search','signup','login','settings','notifications','premium','topics','ranking','magazine'].includes(name)) return null;
-    return name;
+    blockStyle.textContent = `${selectors.join(',\n')} { display: none !important; }`;
   }
 
   // ---- カード要素を探す ----
@@ -106,28 +115,45 @@
     for (let i = 0; i < 20; i++) {
       if (!node) return null;
       const cls = node.className || '';
-      if (typeof cls === 'string' && cls.includes('timelineItemWrapper')) return node;
+      if (typeof cls === 'string' && cls.includes(CARD_CLASS_FRAGMENT)) return node;
       node = node.parentElement;
     }
     return null;
   }
 
-  // ---- ブロックボタンを付与（DOM操作はボタン追加のみ） ----
-  function addBlockButtons() {
+  // ---- ブロックボタンを付与（root自身 + 子孫、DOM再利用に対応） ----
+  function addBlockButtonsInSubtree(root) {
     const blockList = getBlockList();
-    const allLinks = document.querySelectorAll('a[href*="/n/"]');
 
-    allLinks.forEach(link => {
+    const links = [];
+    if (root.matches && root.matches('a[href*="/n/"]')) {
+      links.push(root);
+    }
+    if (root.querySelectorAll) {
+      links.push(...root.querySelectorAll('a[href*="/n/"]'));
+    }
+
+    links.forEach(link => {
       const href = link.getAttribute('href');
-      if (!href || !href.match(/^\/[^\/]+\/n\//)) return;
-
       const username = extractUsername(href);
       if (!username) return;
-      if (blockList.includes(username)) return; // ブロック済みはCSSで消えるのでボタン不要
+      if (blockList.includes(username)) return;
 
       const card = findCard(link);
-      if (!card || card.dataset.nbBtn === '1') return;
-      card.dataset.nbBtn = '1';
+      if (!card) return;
+
+      // DOM再利用検出: カードの中身が別ユーザーに差し替わった場合、
+      // 古いボタンを除去して再処理する
+      const prevUser = card.dataset.nbUser;
+      if (prevUser === username) return; // 同じユーザー、処理済み
+
+      if (prevUser && prevUser !== username) {
+        // カードが再利用された: 古いボタンを除去
+        const oldBtn = card.querySelector('.note-blocker-btn');
+        if (oldBtn) oldBtn.remove();
+      }
+
+      card.dataset.nbUser = username;
 
       card.classList.add('nb-hover');
       const pos = window.getComputedStyle(card).position;
@@ -143,13 +169,41 @@
         e.stopPropagation();
         if (confirm(`${username} の記事を非表示にしますか？`)) {
           addToBlockList(username);
-          rebuildBlockCSS();  // CSSルール更新 → 即座に非表示
+          rebuildBlockCSS();
           updatePanelList();
         }
       });
 
       card.appendChild(btn);
     });
+  }
+
+  // ---- MutationObserver（追加ノードを蓄積 + debounce） ----
+  const pendingRoots = new Set();
+  let debounceTimer = null;
+  const DEBOUNCE_MS = 200;
+
+  function handleMutations(mutations) {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          pendingRoots.add(node);
+        }
+      }
+    }
+    if (pendingRoots.size === 0) return;
+
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      const roots = [...pendingRoots];
+      pendingRoots.clear();
+      for (const root of roots) {
+        if (root.isConnected) {
+          addBlockButtonsInSubtree(root);
+        }
+      }
+      debounceTimer = null;
+    }, DEBOUNCE_MS);
   }
 
   // ---- 管理パネル ----
@@ -236,6 +290,7 @@
         removeFromBlockList(username);
         rebuildBlockCSS();
         updatePanelList();
+        addBlockButtonsInSubtree(document.body);
       });
       row.appendChild(name);
       row.appendChild(removeBtn);
@@ -243,11 +298,13 @@
     });
   }
 
+  // ---- 初期化 ----
   function init() {
-    rebuildBlockCSS();  // 最初にCSSルール生成 → ページ描画時点で非表示
+    rebuildBlockCSS();
     createPanel();
-    addBlockButtons();
-    const observer = new MutationObserver(() => addBlockButtons());
+    addBlockButtonsInSubtree(document.body);
+
+    const observer = new MutationObserver(handleMutations);
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
